@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type OpenvpnServerHeader struct {
@@ -26,7 +28,8 @@ type OpenvpnServerHeaderField struct {
 
 type OpenVPNExporter struct {
 	statusPaths                 []string
-	openvpnUpDesc               *prometheus.Desc
+	openvpnScrapeableDesc       *prometheus.Desc
+	openvpnServiceUpDesc        *prometheus.Desc
 	openvpnStatusUpdateTimeDesc *prometheus.Desc
 	openvpnConnectedClientsDesc *prometheus.Desc
 	openvpnClientDescs          map[string]*prometheus.Desc
@@ -35,9 +38,13 @@ type OpenVPNExporter struct {
 
 func NewOpenVPNExporter(statusPaths []string, ignoreIndividuals bool) (*OpenVPNExporter, error) {
 	// Metrics exported both for client and server statistics.
-	openvpnUpDesc := prometheus.NewDesc(
-		prometheus.BuildFQName("openvpn", "", "up"),
+	openvpnScrapeableDesc := prometheus.NewDesc(
+		prometheus.BuildFQName("openvpn", "", "scrapeable"),
 		"Whether scraping OpenVPN's metrics was successful.",
+		[]string{"status_path"}, nil)
+	openvpnServiceUpDesc := prometheus.NewDesc(
+		prometheus.BuildFQName("openvpn", "", "up"),
+		"Whether openvpn service is active",
 		[]string{"status_path"}, nil)
 	openvpnStatusUpdateTimeDesc := prometheus.NewDesc(
 		prometheus.BuildFQName("openvpn", "", "status_update_time_seconds"),
@@ -145,7 +152,8 @@ func NewOpenVPNExporter(statusPaths []string, ignoreIndividuals bool) (*OpenVPNE
 
 	return &OpenVPNExporter{
 		statusPaths:                 statusPaths,
-		openvpnUpDesc:               openvpnUpDesc,
+		openvpnScrapeableDesc:       openvpnScrapeableDesc,
+		openvpnServiceUpDesc:        openvpnServiceUpDesc,
 		openvpnStatusUpdateTimeDesc: openvpnStatusUpdateTimeDesc,
 		openvpnConnectedClientsDesc: openvpnConnectedClientsDesc,
 		openvpnClientDescs:          openvpnClientDescs,
@@ -239,7 +247,7 @@ func (e *OpenVPNExporter) collectServerStatusFromReader(statusPath string, file 
 			// Export relevant columns as individual metrics.
 			for _, metric := range header.Metrics {
 				if columnValue, ok := columnValues[metric.Column]; ok {
-					if l, _ := recordedMetrics[metric]; ! subslice(labels, l) {
+					if l, _ := recordedMetrics[metric]; !subslice(labels, l) {
 						value, err := strconv.ParseFloat(columnValue, 64)
 						if err != nil {
 							return err
@@ -280,9 +288,11 @@ func contains(s []string, e string) bool {
 
 // Is a sub-slice of slice
 func subslice(sub []string, main []string) bool {
-	if len(sub) > len(main) {return false}
+	if len(sub) > len(main) {
+		return false
+	}
 	for _, s := range sub {
-		if ! contains(main, s) {
+		if !contains(main, s) {
 			return false
 		}
 	}
@@ -338,8 +348,33 @@ func (e *OpenVPNExporter) collectStatusFromFile(statusPath string, ch chan<- pro
 	return e.collectStatusFromReader(statusPath, conn, ch)
 }
 
+func (e *OpenVPNExporter) collectServiceStatus(statusPath string, ch chan<- prometheus.Metric) float64 {
+
+	splitPath := strings.Split(statusPath, "/")
+	dotSplit := strings.Split(splitPath[len(splitPath)-1], ".")
+	serviceName := dotSplit[0]
+
+	buildServiceName := "openvpn@" + serviceName + ".service"
+
+	resp, err := exec.Command("sudo", "systemctl", "is-active", buildServiceName).Output()
+
+	if err != nil {
+		log.Printf("Failed to read service status: %s", err)
+	}
+
+	str := string(resp[:])
+	str = strings.TrimSpace(str)
+
+	if str == "active" {
+		return 1.0
+	} else {
+		return 0.0
+	}
+}
+
 func (e *OpenVPNExporter) Describe(ch chan<- *prometheus.Desc) {
-	ch <- e.openvpnUpDesc
+	ch <- e.openvpnScrapeableDesc
+	ch <- e.openvpnServiceUpDesc
 }
 
 func (e *OpenVPNExporter) Collect(ch chan<- prometheus.Metric) {
@@ -347,17 +382,27 @@ func (e *OpenVPNExporter) Collect(ch chan<- prometheus.Metric) {
 		err := e.collectStatusFromFile(statusPath, ch)
 		if err == nil {
 			ch <- prometheus.MustNewConstMetric(
-				e.openvpnUpDesc,
+				e.openvpnScrapeableDesc,
 				prometheus.GaugeValue,
-				1.0,
+				1,
 				statusPath)
 		} else {
 			log.Printf("Failed to scrape showq socket: %s", err)
 			ch <- prometheus.MustNewConstMetric(
-				e.openvpnUpDesc,
+				e.openvpnScrapeableDesc,
 				prometheus.GaugeValue,
-				0.0,
+				0,
 				statusPath)
 		}
+
+		active := e.collectServiceStatus(statusPath, ch)
+
+		ch <- prometheus.MustNewConstMetric(
+			e.openvpnServiceUpDesc,
+			prometheus.GaugeValue,
+			active,
+			statusPath)
+
 	}
+
 }
