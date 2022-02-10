@@ -359,7 +359,7 @@ func (e *OpenVPNExporter) collectServiceStatus(statusPath string, ch chan<- prom
 	resp, err := exec.Command("sudo", "systemctl", "is-active", buildServiceName).Output()
 
 	if err != nil {
-		log.Printf("Failed to read service status: %s", err)
+		log.Printf("Failed to read %s status: %s", buildServiceName, err)
 	}
 
 	str := string(resp[:])
